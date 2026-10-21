@@ -104,11 +104,26 @@ def compute_temp(q_ratio, q_u_w, t_in_c, t_fluid_in_c, t_fluid_out_c,
             lmtd_n = (delta_t_hot_n - delta_t_cold_n) / np.log(delta_t_hot_n / delta_t_cold_n)
         a = delta_t / (q_ratio * lmtd_n)
 
-        if a > HeatExchangerControl.OUT_OF_RANGE_THRESHOLD:
-            logger.warning(f"Heat Exchanger state too far from nominal conditions. "
-                           f"The temperature difference between the primary (t_in_c={t_in_c}°C) and "
-                           f"secondary side (t_fluid_out_c={t_fluid_out_c}°C) may be too high or the transferred heat "
-                           f"q_u_w={q_u_w}W too small compared to the nominal conditions")
+        # if a > HeatExchangerControl.OUT_OF_RANGE_THRESHOLD:
+        #     logger.warning(f"Heat Exchanger state too far from nominal conditions. "
+        #                    f"The temperature difference between the primary (t_in_c={t_in_c}°C) and "
+        #                    f"secondary side (t_fluid_out_c={t_fluid_out_c}°C) may be too high or the transferred heat "
+        #                    f"q_u_w={q_u_w}W too small compared to the nominal conditions")
+        #     t_out_c = t_in_c
+        if (
+            a > HeatExchangerControl.OUT_OF_RANGE_THRESHOLD
+            and heat_consumer
+            and q_ratio > 0
+            and q_u_w > 0
+            and t_fluid_in_c > t_fluid_out_c > t_in_c
+        ):
+            # Temporary low-load approximation for the dry cooler
+            t_out_c = t_fluid_in_c
+
+        elif a > HeatExchangerControl.OUT_OF_RANGE_THRESHOLD:
+            logger.warning(
+                "Heat exchanger state outside supported range."
+            )
             t_out_c = t_in_c
         else:
             delta_t_result = calculate_temperature_difference(a, delta_t, is_cold=not heat_consumer)

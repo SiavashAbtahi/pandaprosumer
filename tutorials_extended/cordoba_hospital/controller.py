@@ -3,7 +3,7 @@ from pandaprosumer.mapping.fluid_mix import FluidMixMapping
 from pandaprosumer.controller.base import BasicProsumerController
 from pandaprosumer.controller.models.heat_pump import HeatPumpController
 from pandaprosumer.constants import CELSIUS_TO_K, TEMPERATURE_CONVERGENCE_THRESHOLD_C
-
+from pandapower.control.basic_controller import Controller
 class CoupledHeatPumpController(HeatPumpController):
 
     def name_class(self):
@@ -18,6 +18,7 @@ class CoupledHeatPumpController(HeatPumpController):
             in_service=True,
             index=None,
             name=None,
+            cooling_led=False,
             **kwargs
     ):
         super().__init__(
@@ -30,6 +31,8 @@ class CoupledHeatPumpController(HeatPumpController):
             name=name,
             **kwargs
         )
+
+        self.cooling_led = cooling_led
         # Mapping-order aus FluidMixEnergySystemMapping (siehe result_fluid_mix)
         self._MAPPING_ORDER_COND = 0
         self._MAPPING_ORDER_EVAP = 1
@@ -149,6 +152,39 @@ class CoupledHeatPumpController(HeatPumpController):
     def get_treturn_tab_c_evap(self, prosumer):
         return self._get_treturn_tab_c_side(prosumer, self._get_mapped_responders_evap(prosumer))
 
+    def _condenser_flow_for_cooling(
+        self,
+        prosumer,
+        mdot_evap_required_kg_per_s,
+        t_evap_out_required_c,
+        t_cond_in_required_c,
+        t_cond_out_required_c,
+    ):
+
+        if mdot_evap_required_kg_per_s == 0:
+            return 0.0
+
+        # Temperaturdifferenz für die spätere Berechnung mit _calculate_heat_pump speichern.
+        delta_t_required_c = (self._t_evap_in_c - t_evap_out_required_c)
+
+        element_table = getattr(prosumer, self.obj.element_name)
+
+        element_table.at[
+            self.obj.element_index[0], "delta_t_evap_c"
+        ] = delta_t_required_c
+
+        cooling_request = self._calculate_heat_pump_reverse(
+            prosumer,
+            mdot_evap_required_kg_per_s,
+            self._t_evap_in_c,
+            t_evap_out_required_c,
+            t_cond_in_required_c,
+            t_cond_out_required_c,
+        )
+
+        # Fifth result: condenser-side water mass flow.
+        return cooling_request[4]
+
 
     def control_step(self, prosumer):
         """
@@ -187,11 +223,26 @@ class CoupledHeatPumpController(HeatPumpController):
         #     # Verbindliche Randbedingung aus dem heißen Netz:
         #     t_cond_out_required_c = self._t_cond_out_c
 
-        mdot_cond_required_kg_per_s = np.sum(mdot_tab_required_kg_per_s)
+        # mdot_cond_required_kg_per_s = np.sum(mdot_tab_required_kg_per_s)
 
         t_evap_out_required_c, t_evap_in_expected_c, mdot_tab_evap_required_kg_per_s = self.t_m_to_deliver_evap(
             prosumer)
         mdot_evap_required_kg_per_s = np.sum(mdot_tab_evap_required_kg_per_s)
+
+        if self.cooling_led:
+            mdot_cond_required_kg_per_s = (
+                self._condenser_flow_for_cooling(
+                    prosumer,
+                    mdot_evap_required_kg_per_s,
+                    t_evap_out_required_c,
+                    t_cond_in_required_c,
+                    t_cond_out_required_c,
+                )
+            )
+        else:
+            mdot_cond_required_kg_per_s = np.sum(mdot_tab_required_kg_per_s)
+
+
         # t_evap_in_expected_c aktuell nur informativ, siehe Annahme (2) unten
 
         assert not np.isnan(mdot_cond_required_kg_per_s), f"Heat Pump {self.name} mdot_cond_required_kg_per_s is NaN for timestep {self.time} in prosumer {prosumer.name}"
@@ -397,3 +448,122 @@ class CoupledHeatPumpController(HeatPumpController):
             # self.p_comp_previous_kw = p_comp_kw
             self.input_mass_flow_with_temp = {FluidMixMapping.TEMPERATURE_KEY: np.nan,
                                               FluidMixMapping.MASS_FLOW_KEY: np.nan}
+
+
+
+class PVTemperatureController(Controller):
+    def __init__(self, net_hot, net_cold, prosumer_prod, hp_controller_index, data_source,):
+        super().__init__(
+            net_hot,
+            level=2,
+            order=1,
+            initial_run=False,
+        )
+
+        self.net_cold = net_cold
+        self.producer = prosumer_prod
+        self.hp = prosumer_prod.controller.at[
+            hp_controller_index, "object"
+        ]
+        self.data_source = data_source
+        self.applied = False
+        self.trigger_run_func = False
+
+    def time_step(self, net, time):
+        self.time = time
+        self.applied = False
+
+    def is_converged(self, net):
+        return self.applied
+
+    def control_step(self, net):
+        frame = self.data_source.df
+        target_c = 78.0
+
+        if frame.at[self.time, "pv_surplus_kw"] > 0.0:
+
+            return_c = float(
+                net.res_circ_pump_pressure.iloc[0]["t_from_k"]
+            ) - 273.15
+
+            cold_in_c = float(
+                self.net_cold.res_circ_pump_pressure.iloc[0]["t_from_k"]
+            ) - 273.15
+
+            boiler_limit_kw = float(
+                frame.at[self.time, "boiler_reference_kw"]
+            )
+
+            cp_reference = float(
+                self.hp.cond_fluid.get_heat_capacity(
+                    273.15 + (78.0 + return_c) / 2
+                )
+            ) / 1000.0
+
+            # Current demands have already been written by order=0.
+            # Estimate flow from the heat consumers' fixed delta-T.
+            mdot = 0.0
+            for _, consumer in net.heat_consumer.iterrows():
+                if not consumer.in_service or consumer.qext_w <= 0:
+                    continue
+
+                delta = float(consumer.deltat_k)
+                mdot += (
+                    float(consumer.qext_w) / 1000.0
+                    / (cp_reference * delta)
+                )
+
+            pinch = self.hp._get_element_param(
+                self.producer, "pinch_c"
+            )
+
+            def acceptable(temperature_c):
+                cp = float(
+                    self.hp.cond_fluid.get_heat_capacity(
+                        273.15 + (temperature_c + return_c) / 2
+                    )
+                ) / 1000.0
+
+                required_heat_kw = (
+                    mdot * cp * (temperature_c - return_c)
+                )
+
+                result = self.hp._calculate_heat_pump(
+                    self.producer,
+                    mdot,
+                    temperature_c,
+                    return_c,
+                    cold_in_c,
+                    pinch,
+                )
+
+                hp_heat_kw = float(result[0])
+                actual_out_c = float(result[6])
+
+
+                needed_boiler_kw = required_heat_kw - hp_heat_kw
+
+                return (
+                    abs(actual_out_c - temperature_c) <= 0.05
+                    and needed_boiler_kw <= boiler_limit_kw
+                )
+
+            if mdot > 0.0:
+                if acceptable(80.0):
+                    target_c = 80.0
+                elif acceptable(78.0):
+                    low, high = 78.0, 80.0
+                    for _ in range(12):
+                        middle = (low + high) / 2
+                        if acceptable(middle):
+                            low = middle
+                        else:
+                            high = middle
+                    target_c = low
+
+        net.circ_pump_pressure.loc[:, "t_flow_k"] = (
+            target_c + 273.15
+        )
+        frame.at[self.time, "hot_supply_target_c"] = target_c
+
+        self.applied = True

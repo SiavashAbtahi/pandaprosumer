@@ -1,3 +1,5 @@
+from typing import Any
+
 from pandaprosumer import create_controlled_gas_boiler
 from pandapower.control.controller.const_control import ConstControl
 from pandaprosumer.create_controlled import (create_controlled_network_coupling,create_controlled_heat_pump,
@@ -10,6 +12,7 @@ from pandaprosumer.mapping import FluidMixEnergySystemMapping, GenericEnergySyst
 from pandaprosumer.create import create_heat_pump
 from pandaprosumer.controller.data_model import HeatPumpControllerData
 from controller import CoupledHeatPumpController
+from controller import PVTemperatureController
 from pandapower import get_element_index
 import numpy as np
 
@@ -29,7 +32,7 @@ nc_write_level_cold = 1
 nc_write_chiller_cold = 3
 
 
-def create_prosumer_heat_demand(data_source, time_res, start, end, net_hot):
+def create_prosumer_heat_demand(data_source: object, time_res: object, start: object, end: object, net_hot: object) -> Any:
     prosumer = create_empty_prosumer_container("heat demand")
     period = create_period(prosumer, time_res, start, end, 'utc', 'default')
 
@@ -134,7 +137,7 @@ def create_prosumer_prod(data_source, time_res, start, end, net_hot, net_cold):
         heat_pump_controller_data,
         order=4,
         level=prosumer_prod_level_hot,
-        name='hp_controller'
+        name='hp_controller',
     )
 
     hp_controller_index = hp_controller.index
@@ -237,7 +240,8 @@ def create_prosumer_prod(data_source, time_res, start, end, net_hot, net_cold):
         chiller_controller_data,
         order=6,
         level=prosumer_prod_level_cold,
-        name='reversed_hp_controller'
+        name='reversed_hp_controller',
+        cooling_led = True
     )
 
     chiller_controller_index = chiller_controller.index
@@ -578,7 +582,6 @@ def create_prosumer_dhw_system(
 def prepare_winter_pv_control_profiles(
     demand_data,
     normal_temperature_c=78.0,
-    surplus_temperature_c=80.0,
     normal_hp_limit_kw=100.0,
     maximum_hp_limit_kw=350.0
 ):
@@ -594,12 +597,7 @@ def prepare_winter_pv_control_profiles(
         normal_hp_limit_kw
     )
 
-    # Hot-network supply-temperature target
-    demand_data["hot_supply_target_c"] = np.where(
-        demand_data["pv_surplus_kw"] > 0.0,
-        surplus_temperature_c,
-        normal_temperature_c
-    )
+    demand_data["hot_supply_target_c"] = normal_temperature_c
 
     # pandapipes uses Kelvin
     demand_data["hot_supply_target_k"] = (
@@ -610,55 +608,40 @@ def prepare_winter_pv_control_profiles(
     return demand_data
 
 
-# def add_winter_pv_controllers(
-#         prosumer_prod,
-#         net_hot,
-#         data_source,
-#         hp_controller_index
-# ):
-#
-#     hp_element_index = (
-#         prosumer_prod.controller.at[
-#             hp_controller_index,
-#             "object"
-#         ].obj.element_index[0]
-#     )
-#
-#     # Apply the hourly compressor-power limit.
-#     hp_power_controller = ConstControl(
-#         prosumer_prod,
-#         element="heat_pump",
-#         variable="max_p_comp_kw",
-#         element_index=hp_element_index,
-#         profile_name="hp_power_limit_kw",
-#         data_source=data_source,
-#         level=1,
-#         order=0
-#     )
-#
-#     # Find the physical circulation pump
-#     # of the hot network.
-#     hot_pump_index = get_element_index(
-#         net_hot,
-#         "circ_pump_pressure",
-#         "pump_hp_coupling"
-#     )
-#
-#     # Apply the hourly hot-network temperature:
-#     # 78°C normally and 80°C during PV surplus.
-#     temperature_controller = ConstControl(
-#         net_hot,
-#         element="circ_pump_pressure",
-#         variable="t_flow_k",
-#         element_index=hot_pump_index,
-#         profile_name="hot_supply_target_k",
-#         data_source=data_source,
-#         level=1,
-#         order=0
-#     )
-#
-#     return hp_power_controller, temperature_controller
+def add_winter_pv_controllers(
+    prosumer_prod,
+    net_hot,
+    data_source,
+    hp_controller_index,
+    net_cold,
+):
 
+    hp_element_index = (
+        prosumer_prod.controller.at[
+            hp_controller_index, "object"
+        ].obj.element_index[0]
+    )
+
+    hp_power_controller = ConstControl(
+        prosumer_prod,
+        element="heat_pump",
+        variable="max_p_comp_kw",
+        element_index=hp_element_index,
+        profile_name="hp_power_limit_kw",
+        data_source=data_source,
+        level=1,
+        order=0,
+    )
+
+    temperature_controller = PVTemperatureController(
+        net_hot=net_hot,
+        net_cold=net_cold,
+        prosumer_prod=prosumer_prod,
+        hp_controller_index=hp_controller_index,
+        data_source=data_source,
+    )
+
+    return hp_power_controller, temperature_controller
 
 def create_prosumer_cooling_demand(data_source, time_res, start, end, net_cold):
 
